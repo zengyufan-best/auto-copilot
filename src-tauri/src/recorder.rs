@@ -641,6 +641,11 @@ mod rdev_listen {
                         }
                         EventType::KeyPress(key) => {
                             let dbg = format!("{:?}", key);
+                            // Diagnostic: always log the raw key rdev reports, so
+                            // we can tell "event never arrived" apart from "arrived
+                            // but the name was unmapped".
+                            log(&format!("rdev keypress raw {}", dbg));
+
                             if s.pressed.contains(&dbg) {
                                 return; // ignore auto-repeat while held
                             }
@@ -650,43 +655,45 @@ mod rdev_listen {
                                 return; // modifiers attach to the next real key
                             }
 
-                            if let Some(key_str) = map_key(&dbg) {
-                                let modifiers = collect_modifiers(&s.pressed);
+                            // Map to a usable key string, falling back to the raw
+                            // lowercased name so an unmapped key still fills the
+                            // pick field instead of being silently dropped.
+                            let key_str = map_key(&dbg).unwrap_or_else(|| dbg.to_lowercase());
+                            let modifiers = collect_modifiers(&s.pressed);
 
-                                // One-shot: pick a key.
-                                if pick_key {
-                                    if cap.recently_armed() {
-                                        return;
-                                    }
-                                    cap.pick_key.store(false, Ordering::Relaxed);
-                                    log(&format!("picked key '{}'", key_str));
-                                    let _ = app.emit(
-                                        "picked-key",
-                                        PickedKey {
-                                            key: key_str,
-                                            modifiers,
-                                        },
-                                    );
+                            // One-shot: pick a key.
+                            if pick_key {
+                                if cap.recently_armed() {
                                     return;
                                 }
-
-                                if !recording {
-                                    return;
-                                }
-                                let gap = s.last_event.elapsed().as_millis() as u64;
-                                s.last_event = Instant::now();
-                                log(&format!("record key '{}'", key_str));
+                                cap.pick_key.store(false, Ordering::Relaxed);
+                                log(&format!("picked key '{}'", key_str));
                                 let _ = app.emit(
-                                    "recorded-action",
-                                    RecordedEvent {
-                                        action: RecordedAction::KeyPress {
-                                            key: key_str,
-                                            modifiers,
-                                        },
-                                        gap_ms: gap,
+                                    "picked-key",
+                                    PickedKey {
+                                        key: key_str,
+                                        modifiers,
                                     },
                                 );
+                                return;
                             }
+
+                            if !recording {
+                                return;
+                            }
+                            let gap = s.last_event.elapsed().as_millis() as u64;
+                            s.last_event = Instant::now();
+                            log(&format!("record key '{}'", key_str));
+                            let _ = app.emit(
+                                "recorded-action",
+                                RecordedEvent {
+                                    action: RecordedAction::KeyPress {
+                                        key: key_str,
+                                        modifiers,
+                                    },
+                                    gap_ms: gap,
+                                },
+                            );
                         }
                         EventType::KeyRelease(key) => {
                             s.pressed.remove(&format!("{:?}", key));
