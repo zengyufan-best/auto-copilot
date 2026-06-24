@@ -66,15 +66,9 @@ pub fn start_pick_position(app: AppHandle, state: State<'_, AppState>) -> Result
     crate::recorder::ensure_listener(app, state.capture.clone())
 }
 
-/// Arm a one-shot key pick (Windows/Linux only). macOS keyboard capture is
-/// unavailable (rdev segfaults on the tap thread), so we reject it up front.
-#[cfg(target_os = "macos")]
-#[tauri::command]
-pub fn start_pick_key(_app: AppHandle, _state: State<'_, AppState>) -> Result<(), String> {
-    Err("macOS 暂不支持键位拾取,请在 Windows 上录制键盘,或手动填写按键。".to_string())
-}
-
-#[cfg(not(target_os = "macos"))]
+/// Arm a one-shot key pick: the next key press anywhere is captured and emitted
+/// as a `picked-key` event, then disarmed. Supported on all desktop platforms
+/// (macOS reads the raw keycode via its own event tap, avoiding the rdev crash).
 #[tauri::command]
 pub fn start_pick_key(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.capture.arm();

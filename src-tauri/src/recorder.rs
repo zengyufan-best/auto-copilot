@@ -205,19 +205,19 @@ pub fn ensure_listener(app: AppHandle, state: Arc<CaptureState>) -> Result<(), S
 }
 
 // ============================================================================
-// macOS: a mouse-only CGEventTap.
+// macOS: a CGEventTap capturing mouse-down AND key-down events.
 //
-// rdev's macOS backend resolves a unicode "name" for every key event by calling
-// into the keyboard-layout APIs, which segfaults from the tap thread (the crash
+// rdev's macOS backend segfaults from the tap thread because it resolves a
+// unicode "name" for every key event via the keyboard-layout APIs (the crash
 // happens inside rdev before our callback runs, so catch_unwind can't help).
-// We therefore never let rdev run on macOS. Instead we create our own event tap
-// whose interest mask contains ONLY mouse-down events, so key events are never
-// delivered to (or decoded by) us — no keyboard recording on macOS for now, but
-// no crash either. Keyboard recording stays available on Windows via rdev.
+// We never let rdev run on macOS. Instead we own the event tap and, for key
+// events, read only the raw integer keycode (CGEventGetIntegerValueField) and
+// map it ourselves — no unicode-layout resolution, so no crash. This gives us
+// keyboard pick/record on macOS as well as mouse.
 // ============================================================================
 #[cfg(target_os = "macos")]
 mod macos_tap {
-    use super::{log, CaptureState, PickedPosition, RecordedAction, RecordedEvent};
+    use super::{log, CaptureState, PickedKey, PickedPosition, RecordedAction, RecordedEvent};
     use std::os::raw::c_void;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
@@ -258,6 +258,13 @@ mod macos_tap {
         ) -> CFMachPortRef;
         fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
         fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+        // Read an integer field (e.g. the raw keyboard keycode) from an event.
+        // We deliberately read ONLY the integer keycode and never ask macOS to
+        // resolve a unicode key name — that name lookup (what rdev does) is what
+        // segfaults on the tap thread.
+        fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+        // Modifier flags (shift/ctrl/alt/cmd) packed into a bitmask.
+        fn CGEventGetFlags(event: CGEventRef) -> u64;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -281,8 +288,72 @@ mod macos_tap {
     const LEFT_MOUSE_DOWN: u32 = 1;
     const RIGHT_MOUSE_DOWN: u32 = 3;
     const OTHER_MOUSE_DOWN: u32 = 25;
+    const KEY_DOWN: u32 = 10;
     const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
     const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+
+    // Field index for the raw keyboard keycode (kCGKeyboardEventKeycode).
+    const KEYBOARD_EVENT_KEYCODE: u32 = 9;
+
+    // CGEventFlags modifier bits.
+    const FLAG_SHIFT: u64 = 1 << 17;
+    const FLAG_CONTROL: u64 = 1 << 18;
+    const FLAG_ALTERNATE: u64 = 1 << 19; // Option
+    const FLAG_COMMAND: u64 = 1 << 20;
+
+    fn modifiers_from_flags(flags: u64) -> Vec<String> {
+        let mut mods = Vec::new();
+        if flags & FLAG_CONTROL != 0 {
+            mods.push("Ctrl".to_string());
+        }
+        if flags & FLAG_SHIFT != 0 {
+            mods.push("Shift".to_string());
+        }
+        if flags & FLAG_ALTERNATE != 0 {
+            mods.push("Alt".to_string());
+        }
+        if flags & FLAG_COMMAND != 0 {
+            mods.push("Meta".to_string());
+        }
+        mods
+    }
+
+    /// Map a macOS virtual keycode to the same key-name vocabulary that the
+    /// rdev path (`super::map_key`) produces, so the frontend and the executor
+    /// see one consistent set of key names across platforms. Returns `None` for
+    /// keys we don't handle (including pure modifier keys, which arrive as
+    /// flagsChanged events, not keyDown, so they never reach here anyway).
+    fn map_macos_keycode(code: i64) -> Option<String> {
+        let s = match code {
+            0 => "a", 1 => "s", 2 => "d", 3 => "f", 4 => "h", 5 => "g", 6 => "z",
+            7 => "x", 8 => "c", 9 => "v", 11 => "b", 12 => "q", 13 => "w", 14 => "e",
+            15 => "r", 16 => "y", 17 => "t", 31 => "o", 32 => "u", 34 => "i",
+            35 => "p", 37 => "l", 38 => "j", 40 => "k", 45 => "n", 46 => "m",
+            18 => "1", 19 => "2", 20 => "3", 21 => "4", 22 => "6", 23 => "5",
+            25 => "9", 26 => "7", 28 => "8", 29 => "0",
+            24 => "=", 27 => "-", 30 => "]", 33 => "[", 39 => "'", 41 => ";",
+            42 => "\\", 43 => ",", 44 => "/", 47 => ".", 50 => "`",
+            36 | 76 => "enter",
+            48 => "tab",
+            49 => "space",
+            51 => "backspace",
+            53 => "escape",
+            115 => "home",
+            116 => "pageup",
+            117 => "delete",
+            119 => "end",
+            121 => "pagedown",
+            123 => "left",
+            124 => "right",
+            125 => "down",
+            126 => "up",
+            122 => "f1", 120 => "f2", 99 => "f3", 118 => "f4", 96 => "f5",
+            97 => "f6", 98 => "f7", 100 => "f8", 101 => "f9", 109 => "f10",
+            103 => "f11", 111 => "f12",
+            _ => return None,
+        };
+        Some(s.to_string())
+    }
 
     struct TapContext {
         app: AppHandle,
@@ -310,6 +381,49 @@ mod macos_tap {
             if !tap.is_null() {
                 unsafe { CGEventTapEnable(tap, true) };
             }
+            return event;
+        }
+
+        // Keyboard: read ONLY the raw keycode integer + modifier flags. We never
+        // ask macOS to resolve a unicode key name (that lookup is what crashes
+        // rdev on this thread), so this is crash-safe.
+        if etype == KEY_DOWN {
+            let code = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) };
+            let key = match map_macos_keycode(code) {
+                Some(k) => k,
+                None => return event,
+            };
+            let flags = unsafe { CGEventGetFlags(event) };
+            let modifiers = modifiers_from_flags(flags);
+
+            // One-shot: pick a key.
+            if ctx.state.pick_key.load(Ordering::Relaxed) {
+                if ctx.state.recently_armed() {
+                    return event;
+                }
+                ctx.state.pick_key.store(false, Ordering::Relaxed);
+                log(&format!("macos picked key '{}'", key));
+                let _ = ctx.app.emit("picked-key", PickedKey { key, modifiers });
+                return event;
+            }
+
+            if !ctx.state.recording.load(Ordering::Relaxed) {
+                return event;
+            }
+            let gap = {
+                let mut last = ctx.last_event.lock().unwrap();
+                let g = last.elapsed().as_millis() as u64;
+                *last = Instant::now();
+                g
+            };
+            log(&format!("macos key '{}' gap={}", key, gap));
+            let _ = ctx.app.emit(
+                "recorded-action",
+                RecordedEvent {
+                    action: RecordedAction::KeyPress { key, modifiers },
+                    gap_ms: gap,
+                },
+            );
             return event;
         }
 
@@ -373,11 +487,12 @@ mod macos_tap {
         let ctx_addr = Box::into_raw(ctx) as usize;
 
         std::thread::spawn(move || {
-            log("macos mouse tap thread spawned");
+            log("macos input tap thread spawned");
             let ctx_ptr = ctx_addr as *mut TapContext;
             let mask: u64 = (1u64 << LEFT_MOUSE_DOWN)
                 | (1u64 << RIGHT_MOUSE_DOWN)
-                | (1u64 << OTHER_MOUSE_DOWN);
+                | (1u64 << OTHER_MOUSE_DOWN)
+                | (1u64 << KEY_DOWN);
 
             let tap = unsafe {
                 CGEventTapCreate(
@@ -395,7 +510,7 @@ mod macos_tap {
                 let ctx = unsafe { &*ctx_ptr };
                 let _ = ctx.app.emit(
                     "recording-error",
-                    "无法创建鼠标监听,请确认已在「系统设置 → 隐私与安全性 → 输入监控」中授权 Auto-Pilot 后,完全退出并重启应用。".to_string(),
+                    "无法创建输入监听,请确认已在「系统设置 → 隐私与安全性 → 输入监控」中授权 Auto-Pilot 后,完全退出并重启应用。".to_string(),
                 );
                 ctx.state.recording.store(false, Ordering::Relaxed);
                 super::LISTENER_STARTED.store(false, Ordering::SeqCst);
@@ -412,7 +527,7 @@ mod macos_tap {
                 let run_loop = CFRunLoopGetCurrent();
                 CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
                 CGEventTapEnable(tap, true);
-                log("macos mouse tap enabled, entering run loop");
+                log("macos input tap enabled, entering run loop");
                 CFRunLoopRun();
             }
         });
