@@ -108,6 +108,22 @@ body {
   color: var(--accent);
 }
 
+.btn-picking {
+  background: var(--accent);
+  color: white;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.pick-hint {
+  margin: 4px 0 12px;
+  padding: 8px 12px;
+  background: rgba(233, 69, 96, 0.1);
+  border: 1px dashed var(--accent);
+  border-radius: var(--radius);
+  font-size: 12px;
+  color: var(--accent);
+}
+
 .action-desc-edit {
   display: flex;
   align-items: center;

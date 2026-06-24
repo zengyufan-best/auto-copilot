@@ -1,0 +1,30 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6E5BF8"/>
+      <stop offset="0.55" stop-color="#8A45F2"/>
+      <stop offset="1" stop-color="#A23BE8"/>
+    </linearGradient>
+    <radialGradient id="gloss" cx="0.3" cy="0.22" r="0.9">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.30"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="plane" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#E6E2FF"/>
+    </linearGradient>
+    <filter id="sh" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="20" stdDeviation="30" flood-color="#241058" flood-opacity="0.40"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="232" fill="url(#gloss)"/>
+
+  <g filter="url(#sh)" transform="rotate(-18 512 512)">
+    <g transform="translate(187,200) scale(26)">
+      <path d="M2.01 21 L23 12 L2.01 3 L2 10 L17 12 L2 14 Z" fill="url(#plane)"/>
+    </g>
+  </g>
+</svg>

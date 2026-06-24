@@ -9,7 +9,6 @@ interface Props {
   onRemove: (index: number) => void;
   onMove: (from: number, to: number) => void;
   onUpdate: (index: number, action: Action) => void;
-  onGetCursorPosition: () => Promise<{ x: number; y: number } | null>;
   recording: boolean;
   onToggleRecording: () => void;
 }
@@ -20,7 +19,6 @@ export function PipelineEditor({
   onRemove,
   onMove,
   onUpdate,
-  onGetCursorPosition,
   recording,
   onToggleRecording,
 }: Props) {
@@ -86,7 +84,6 @@ export function PipelineEditor({
             setShowForm(false);
           }}
           onCancel={() => setShowForm(false)}
-          onGetCursorPosition={onGetCursorPosition}
         />
       )}
     </div>

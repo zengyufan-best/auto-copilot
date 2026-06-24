@@ -1,11 +1,51 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 static LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
+
+// How long after arming a one-shot pick we ignore input events, so the very
+// click/keypress that armed the pick is never captured as the picked value.
+const ARM_GUARD_MS: u128 = 250;
+
+/// Shared capture state. A single global listener reads these flags and decides
+/// what to do with each input event: record it, treat it as a one-shot pick, or
+/// ignore it. Held behind an `Arc` in `AppState` and the listener thread.
+pub struct CaptureState {
+    pub recording: AtomicBool,
+    pub pick_position: AtomicBool,
+    pub pick_key: AtomicBool,
+    armed_at: Mutex<Instant>,
+}
+
+impl CaptureState {
+    pub fn new() -> Self {
+        Self {
+            recording: AtomicBool::new(false),
+            pick_position: AtomicBool::new(false),
+            pick_key: AtomicBool::new(false),
+            armed_at: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Mark "now" as the moment a one-shot pick was armed.
+    pub fn arm(&self) {
+        if let Ok(mut t) = self.armed_at.lock() {
+            *t = Instant::now();
+        }
+    }
+
+    /// True while we are still within the guard window after arming.
+    fn recently_armed(&self) -> bool {
+        self.armed_at
+            .lock()
+            .map(|t| t.elapsed().as_millis() < ARM_GUARD_MS)
+            .unwrap_or(false)
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod macos_perm {
@@ -28,10 +68,13 @@ pub fn log(msg: &str) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // Cross-platform: %TEMP%\auto-pilot-rec.log on Windows, /tmp/... on Unix.
+    let mut path = std::env::temp_dir();
+    path.push("auto-pilot-rec.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/auto-pilot-rec.log")
+        .open(&path)
     {
         let _ = writeln!(f, "{} {}", ts, msg);
     }
@@ -52,6 +95,19 @@ pub struct RecordedEvent {
     pub action: RecordedAction,
     #[serde(rename = "gapMs")]
     pub gap_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PickedPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)] // only emitted on the rdev (non-macOS) path
+pub struct PickedKey {
+    pub key: String,
+    pub modifiers: Vec<String>,
 }
 
 // Used by the rdev path (Windows/Linux) and the unit tests.
@@ -117,35 +173,35 @@ fn map_key(name: &str) -> Option<String> {
     Some(mapped.to_string())
 }
 
-pub fn start_recording(app: AppHandle, flag: Arc<AtomicBool>) {
-    log("start_recording called");
+/// Ensure the single app-lifetime global listener is running. Safe to call
+/// repeatedly; only the first call actually starts a listener. Returns an error
+/// string (for the UI) when the platform refuses to start one (e.g. macOS
+/// permission missing).
+pub fn ensure_listener(app: AppHandle, state: Arc<CaptureState>) -> Result<(), String> {
+    log("ensure_listener called");
 
     #[cfg(target_os = "macos")]
     {
         if !macos_perm::has_access() {
             log("macos input monitoring NOT granted; requesting");
             macos_perm::request_access();
-            let _ = app.emit(
-                "recording-error",
-                "需要「输入监控」权限才能录制。请在弹出的系统提示中点击「打开系统设置」并允许 Auto-Pilot,或前往「系统设置 → 隐私与安全性 → 输入监控」勾选 Auto-Pilot,然后完全退出并重启应用后重试。".to_string(),
-            );
-            flag.store(false, Ordering::Relaxed);
-            return;
+            return Err("需要「输入监控」权限。请在「系统设置 → 隐私与安全性 → 输入监控」中勾选 Auto-Pilot,然后完全退出并重启应用后重试。".to_string());
         }
         log("macos input monitoring granted");
     }
 
-    // Only one global listener for the whole app lifetime; it is gated by `flag`.
     if LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         log("listener already running, reusing");
-        return;
+        return Ok(());
     }
 
     #[cfg(target_os = "macos")]
-    macos_tap::start(app, flag);
+    macos_tap::start(app, state);
 
     #[cfg(not(target_os = "macos"))]
-    rdev_listen::start(app, flag);
+    rdev_listen::start(app, state);
+
+    Ok(())
 }
 
 // ============================================================================
@@ -161,9 +217,9 @@ pub fn start_recording(app: AppHandle, flag: Arc<AtomicBool>) {
 // ============================================================================
 #[cfg(target_os = "macos")]
 mod macos_tap {
-    use super::{log, RecordedAction, RecordedEvent};
+    use super::{log, CaptureState, PickedPosition, RecordedAction, RecordedEvent};
     use std::os::raw::c_void;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
     use tauri::{AppHandle, Emitter};
@@ -230,7 +286,7 @@ mod macos_tap {
 
     struct TapContext {
         app: AppHandle,
-        flag: Arc<AtomicBool>,
+        state: Arc<CaptureState>,
         last_event: Mutex<Instant>,
         tap: Mutex<CFMachPortRef>,
     }
@@ -257,10 +313,6 @@ mod macos_tap {
             return event;
         }
 
-        if !ctx.flag.load(Ordering::Relaxed) {
-            return event;
-        }
-
         let button = match etype {
             LEFT_MOUSE_DOWN => "left",
             RIGHT_MOUSE_DOWN => "right",
@@ -270,6 +322,21 @@ mod macos_tap {
 
         let point = unsafe { CGEventGetLocation(event) };
         let (x, y) = (point.x as i32, point.y as i32);
+
+        // One-shot: pick a coordinate.
+        if ctx.state.pick_position.load(Ordering::Relaxed) {
+            if ctx.state.recently_armed() {
+                return event; // ignore the click that armed the pick
+            }
+            ctx.state.pick_position.store(false, Ordering::Relaxed);
+            log(&format!("macos picked position ({},{})", x, y));
+            let _ = ctx.app.emit("picked-position", PickedPosition { x, y });
+            return event;
+        }
+
+        if !ctx.state.recording.load(Ordering::Relaxed) {
+            return event;
+        }
 
         let gap = {
             let mut last = ctx.last_event.lock().unwrap();
@@ -294,10 +361,10 @@ mod macos_tap {
         event
     }
 
-    pub fn start(app: AppHandle, flag: Arc<AtomicBool>) {
+    pub fn start(app: AppHandle, state: Arc<CaptureState>) {
         let ctx = Box::new(TapContext {
             app,
-            flag,
+            state,
             last_event: Mutex::new(Instant::now()),
             tap: Mutex::new(std::ptr::null_mut()),
         });
@@ -330,7 +397,7 @@ mod macos_tap {
                     "recording-error",
                     "无法创建鼠标监听,请确认已在「系统设置 → 隐私与安全性 → 输入监控」中授权 Auto-Pilot 后,完全退出并重启应用。".to_string(),
                 );
-                ctx.flag.store(false, Ordering::Relaxed);
+                ctx.state.recording.store(false, Ordering::Relaxed);
                 super::LISTENER_STARTED.store(false, Ordering::SeqCst);
                 return;
             }
@@ -357,10 +424,13 @@ mod macos_tap {
 // ============================================================================
 #[cfg(not(target_os = "macos"))]
 mod rdev_listen {
-    use super::{log, map_key, modifier_of, RecordedAction, RecordedEvent, LISTENER_STARTED};
+    use super::{
+        log, map_key, modifier_of, CaptureState, PickedKey, PickedPosition, RecordedAction,
+        RecordedEvent, LISTENER_STARTED,
+    };
     use std::cell::RefCell;
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::thread;
     use std::time::Instant;
@@ -375,7 +445,17 @@ mod rdev_listen {
         was_recording: bool,
     }
 
-    pub fn start(app: AppHandle, flag: Arc<AtomicBool>) {
+    fn collect_modifiers(pressed: &HashSet<String>) -> Vec<String> {
+        let mut modifiers: Vec<String> = Vec::new();
+        for m in ["Ctrl", "Shift", "Alt", "Meta"] {
+            if pressed.iter().any(|p| modifier_of(p) == Some(m)) {
+                modifiers.push(m.to_string());
+            }
+        }
+        modifiers
+    }
+
+    pub fn start(app: AppHandle, cap: Arc<CaptureState>) {
         let err_app = app.clone();
         thread::spawn(move || {
             log("listener thread spawned, calling rdev::listen");
@@ -394,15 +474,16 @@ mod rdev_listen {
                         s.last_pos = (x as i32, y as i32);
                     }
 
-                    let recording = flag.load(Ordering::Relaxed);
+                    let recording = cap.recording.load(Ordering::Relaxed);
+                    let pick_position = cap.pick_position.load(Ordering::Relaxed);
+                    let pick_key = cap.pick_key.load(Ordering::Relaxed);
+
+                    // Reset the recording gap baseline each time recording begins.
                     if recording && !s.was_recording {
                         s.last_event = Instant::now();
                         s.pressed.clear();
                     }
                     s.was_recording = recording;
-                    if !recording {
-                        return;
-                    }
 
                     match event.event_type {
                         EventType::ButtonPress(button) => {
@@ -413,8 +494,24 @@ mod rdev_listen {
                                 _ => return,
                             };
                             let (x, y) = s.last_pos;
+
+                            // One-shot: pick a coordinate.
+                            if pick_position {
+                                if cap.recently_armed() {
+                                    return;
+                                }
+                                cap.pick_position.store(false, Ordering::Relaxed);
+                                log(&format!("picked position ({},{})", x, y));
+                                let _ = app.emit("picked-position", PickedPosition { x, y });
+                                return;
+                            }
+
+                            if !recording {
+                                return;
+                            }
                             let gap = s.last_event.elapsed().as_millis() as u64;
                             s.last_event = Instant::now();
+                            log(&format!("record mouse {} ({},{})", name, x, y));
                             let _ = app.emit(
                                 "recorded-action",
                                 RecordedEvent {
@@ -439,14 +536,31 @@ mod rdev_listen {
                             }
 
                             if let Some(key_str) = map_key(&dbg) {
-                                let mut modifiers: Vec<String> = Vec::new();
-                                for m in ["Ctrl", "Shift", "Alt", "Meta"] {
-                                    if s.pressed.iter().any(|p| modifier_of(p) == Some(m)) {
-                                        modifiers.push(m.to_string());
+                                let modifiers = collect_modifiers(&s.pressed);
+
+                                // One-shot: pick a key.
+                                if pick_key {
+                                    if cap.recently_armed() {
+                                        return;
                                     }
+                                    cap.pick_key.store(false, Ordering::Relaxed);
+                                    log(&format!("picked key '{}'", key_str));
+                                    let _ = app.emit(
+                                        "picked-key",
+                                        PickedKey {
+                                            key: key_str,
+                                            modifiers,
+                                        },
+                                    );
+                                    return;
+                                }
+
+                                if !recording {
+                                    return;
                                 }
                                 let gap = s.last_event.elapsed().as_millis() as u64;
                                 s.last_event = Instant::now();
+                                log(&format!("record key '{}'", key_str));
                                 let _ = app.emit(
                                     "recorded-action",
                                     RecordedEvent {

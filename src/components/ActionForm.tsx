@@ -1,15 +1,17 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Action, MouseButton } from "../types";
 
 interface Props {
   onSubmit: (action: Action) => void;
   onCancel: () => void;
-  onGetCursorPosition: () => Promise<{ x: number; y: number } | null>;
 }
 
 type ActionType = Action["type"];
+type Picking = null | "position" | "key";
 
-export function ActionForm({ onSubmit, onCancel, onGetCursorPosition }: Props) {
+export function ActionForm({ onSubmit, onCancel }: Props) {
   const [actionType, setActionType] = useState<ActionType>("mouse_click");
   const [x, setX] = useState(0);
   const [y, setY] = useState(0);
@@ -18,12 +20,47 @@ export function ActionForm({ onSubmit, onCancel, onGetCursorPosition }: Props) {
   const [modifiers, setModifiers] = useState<string[]>([]);
   const [text, setText] = useState("");
   const [ms, setMs] = useState(1000);
+  const [picking, setPicking] = useState<Picking>(null);
+
+  useEffect(() => {
+    const unPos = listen<{ x: number; y: number }>("picked-position", (e) => {
+      setX(e.payload.x);
+      setY(e.payload.y);
+      setPicking(null);
+    });
+    const unKey = listen<{ key: string; modifiers: string[] }>(
+      "picked-key",
+      (e) => {
+        setKey(e.payload.key);
+        setModifiers(e.payload.modifiers ?? []);
+        setPicking(null);
+      }
+    );
+    return () => {
+      unPos.then((f) => f());
+      unKey.then((f) => f());
+      // Make sure no pick stays armed after the form closes.
+      invoke("cancel_pick").catch(() => {});
+    };
+  }, []);
 
   const handlePickPosition = async () => {
-    const pos = await onGetCursorPosition();
-    if (pos) {
-      setX(pos.x);
-      setY(pos.y);
+    setPicking("position");
+    try {
+      await invoke("start_pick_position");
+    } catch (err) {
+      setPicking(null);
+      alert(String(err));
+    }
+  };
+
+  const handlePickKey = async () => {
+    setPicking("key");
+    try {
+      await invoke("start_pick_key");
+    } catch (err) {
+      setPicking(null);
+      alert(String(err));
     }
   };
 
@@ -92,13 +129,18 @@ export function ActionForm({ onSubmit, onCancel, onGetCursorPosition }: Props) {
                 />
               </div>
               <button
-                className="btn btn-secondary"
+                className={`btn ${picking === "position" ? "btn-picking" : "btn-secondary"}`}
                 onClick={handlePickPosition}
-                title="3秒后获取鼠标位置"
+                disabled={picking !== null}
               >
-                拾取坐标
+                {picking === "position" ? "请点击屏幕…" : "拾取坐标"}
               </button>
             </div>
+            {picking === "position" && (
+              <div className="pick-hint">
+                正在拾取坐标:把鼠标移到目标位置点击一下,坐标会自动填入。
+              </div>
+            )}
             {actionType === "mouse_click" && (
               <div className="form-group">
                 <label>鼠标按键</label>
@@ -119,13 +161,27 @@ export function ActionForm({ onSubmit, onCancel, onGetCursorPosition }: Props) {
           <>
             <div className="form-group">
               <label>按键</label>
-              <input
-                type="text"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                placeholder="例如: a, Enter, F5, Space"
-              />
+              <div className="form-row">
+                <input
+                  type="text"
+                  value={key}
+                  onChange={(e) => setKey(e.target.value)}
+                  placeholder="例如: a, Enter, F5, Space"
+                />
+                <button
+                  className={`btn ${picking === "key" ? "btn-picking" : "btn-secondary"}`}
+                  onClick={handlePickKey}
+                  disabled={picking !== null}
+                >
+                  {picking === "key" ? "请按键…" : "拾取键位"}
+                </button>
+              </div>
             </div>
+            {picking === "key" && (
+              <div className="pick-hint">
+                正在拾取键位:按下任意按键(可带 Ctrl/Shift/Alt),会自动填入。
+              </div>
+            )}
             <div className="form-group">
               <label>修饰键</label>
               <div className="modifier-buttons">

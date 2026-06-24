@@ -118,16 +118,6 @@ function App() {
     }
   }, [recording]);
 
-  const handleGetCursorPosition = useCallback(async () => {
-    try {
-      const pos = await invoke<{ x: number; y: number }>("get_cursor_position");
-      return pos;
-    } catch (e) {
-      console.error("Failed to get cursor position:", e);
-      return null;
-    }
-  }, []);
-
   return (
     <div className="app">
       <header className="app-header">
@@ -142,7 +132,6 @@ function App() {
           onRemove={handleRemoveAction}
           onMove={handleMoveAction}
           onUpdate={handleUpdateAction}
-          onGetCursorPosition={handleGetCursorPosition}
           recording={recording}
           onToggleRecording={handleToggleRecording}
         />
