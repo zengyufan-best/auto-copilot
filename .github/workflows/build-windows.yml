@@ -1,0 +1,58 @@
+name: Build Windows
+
+# 手动触发,或推到 main 时自动构建
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri app (Windows)
+        run: pnpm tauri build
+
+      # 独立可执行文件:src-tauri/target/release/auto-pilot.exe
+      - name: Upload standalone exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-pilot-exe
+          path: src-tauri/target/release/auto-pilot.exe
+          if-no-files-found: error
+
+      # 安装包:NSIS (.exe) 和 MSI (.msi)
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-pilot-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
